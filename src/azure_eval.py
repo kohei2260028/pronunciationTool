@@ -20,12 +20,6 @@ def evaluate(wav_path, reference_text):
 
     audio_config = speechsdk.AudioConfig(filename=wav_path)
 
-    # pronunciation_config = speechsdk.PronunciationAssessmentConfig(
-    #     reference_text,
-    #     speechsdk.PronunciationAssessmentGradingSystem.HundredMark,
-    #     speechsdk.PronunciationAssessmentGranularity.Phoneme,
-    #     True
-    # )
     pronunciation_config = speechsdk.PronunciationAssessmentConfig(
         json_string=(
             '{"referenceText":"%s",'
