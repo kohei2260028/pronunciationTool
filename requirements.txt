@@ -1,0 +1,10 @@
+azure-cognitiveservices-speech
+python-dotenv
+sounddevice
+scipy
+pandas
+matplotlib
+praat-parselmouth
+streamlit
+plotly
+streamlit-plotly-events
