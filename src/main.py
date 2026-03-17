@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from record import record_audio
+from record import RecordingCancelled, record_audio_with_gui
 from azure_eval import evaluate, extract_phonemes
 from praat_analysis import analyze, analyze_segment
 
@@ -61,8 +61,11 @@ def run():
         session_id = now.strftime("%Y%m%d_%H%M%S_%f")
         filename = os.path.join(RECORD_DIR, f"{word}_{session_id}.wav")
 
-        input(f"\nPress Enter and say: {word}")
-        record_audio(filename)
+        try:
+            record_audio_with_gui(filename, prompt_text=word)
+        except RecordingCancelled:
+            print("\nRecording session cancelled by user.")
+            break
 
         az = evaluate(filename, word)
         pr = analyze(filename)
