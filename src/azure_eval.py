@@ -25,7 +25,8 @@ def evaluate(wav_path, reference_text):
             '{"referenceText":"%s",'
             '"gradingSystem":"HundredMark",'
             '"granularity":"Phoneme",'
-            '"phonemeAlphabet":"IPA"}' % reference_text
+            '"phonemeAlphabet":"IPA",'
+            '"nBestPhonemeCount":5}' % reference_text
         )
     )
     recognizer = speechsdk.SpeechRecognizer(
@@ -86,6 +87,13 @@ def extract_phonemes(result_json):
         for phoneme_index, phoneme in enumerate(phonemes):
             pa = phoneme.get("PronunciationAssessment", {})
             nbest_phonemes = pa.get("NBestPhonemes", [])
+            misrecognition_candidates = [
+                {
+                    "phoneme": candidate.get("Phoneme"),
+                    "score": candidate.get("Score"),
+                }
+                for candidate in nbest_phonemes
+            ]
 
             phoneme_rows.append({
                 "word_in_result": word_text,
@@ -96,13 +104,7 @@ def extract_phonemes(result_json):
                 "duration": phoneme.get("Duration"),
                 "accuracy": pa.get("AccuracyScore"),
                 # 誤認候補も一緒に保存すると便利
-                "best_spoken_phoneme": (
-                    nbest_phonemes[0].get("Phoneme") if nbest_phonemes else None
-                ),
-                "best_spoken_score": (
-                    nbest_phonemes[0].get("Score") if nbest_phonemes else None
-                ),
-                "nbest_phonemes": nbest_phonemes,
+                "misrecognition_candidates": misrecognition_candidates,
             })
 
     return phoneme_rows

@@ -75,6 +75,229 @@ def parse_samples_json(samples_json):
         return []
 
 
+def parse_candidates_json(candidates_json):
+    if not isinstance(candidates_json, str) or not candidates_json.strip():
+        return []
+    try:
+        data = json.loads(candidates_json)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def format_score(value) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    try:
+        value = float(value)
+    except Exception:
+        return str(value)
+    return f"{value:.0f}" if value.is_integer() else f"{value:.1f}"
+
+
+def pick_misrecognition_candidates(candidates: list, target_phoneme: str | None, limit: int = 3) -> list[dict]:
+    picked = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        phoneme = candidate.get("phoneme")
+        if not phoneme or phoneme == target_phoneme:
+            continue
+        picked.append({
+            "phoneme": str(phoneme),
+            "score": pd.to_numeric(candidate.get("score"), errors="coerce"),
+        })
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def format_misrecognition_summary(candidates: list[dict], target_phoneme: str | None = None, limit: int = 3, show_source: bool = False) -> str:
+    picked = pick_misrecognition_candidates(candidates, target_phoneme, limit=limit)
+    if not picked:
+        return ""
+
+    parts = []
+    for candidate in picked:
+        label = candidate["phoneme"]
+        if show_source and target_phoneme:
+            label = f"{target_phoneme}->{label}"
+        score = candidate.get("score")
+        if score is not None and not pd.isna(score):
+            label = f"{label}({format_score(score)})"
+        parts.append(label)
+    return " | ".join(parts)
+
+
+def enrich_phoneme_misrecognitions(phoneme_df: pd.DataFrame) -> pd.DataFrame:
+    if phoneme_df.empty:
+        return phoneme_df.copy()
+
+    enriched = phoneme_df.copy()
+    summaries = []
+    primary_confusions = []
+    primary_confusion_scores = []
+
+    json_col = "misrecognition_candidates_json"
+    for _, row in enriched.iterrows():
+        candidates = parse_candidates_json(row.get(json_col))
+        target_phoneme = row.get("phoneme")
+        picked = pick_misrecognition_candidates(candidates, target_phoneme, limit=3)
+        summaries.append(format_misrecognition_summary(candidates, target_phoneme, limit=3))
+        if picked:
+            primary_confusions.append(picked[0]["phoneme"])
+            primary_confusion_scores.append(picked[0]["score"])
+        else:
+            primary_confusions.append(None)
+            primary_confusion_scores.append(None)
+
+    enriched["misrecognition_top3"] = summaries
+    enriched["primary_confusion"] = primary_confusions
+    enriched["primary_confusion_score"] = primary_confusion_scores
+    return enriched
+
+
+def build_recording_misrecognition_summary(phoneme_df: pd.DataFrame) -> pd.DataFrame:
+    if phoneme_df.empty or "wav_path" not in phoneme_df.columns:
+        return pd.DataFrame(columns=["wav_path", "phoneme_top1_confusions"])
+
+    rows = []
+    for _, row in phoneme_df.iterrows():
+        target_phoneme = row.get("phoneme")
+        primary_confusion = row.get("primary_confusion")
+        if not target_phoneme or not primary_confusion:
+            continue
+
+        rows.append({
+            "wav_path": row.get("wav_path"),
+            "word_index": pd.to_numeric(row.get("word_index"), errors="coerce"),
+            "phoneme_index": pd.to_numeric(row.get("phoneme_index"), errors="coerce"),
+            "target_phoneme": str(target_phoneme),
+            "primary_confusion": str(primary_confusion),
+            "primary_confusion_score": pd.to_numeric(row.get("primary_confusion_score"), errors="coerce"),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["wav_path", "phoneme_top1_confusions"])
+
+    summary_df = pd.DataFrame(rows).sort_values(
+        ["wav_path", "word_index", "phoneme_index"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+
+    agg_rows = []
+    for wav_path, grp in summary_df.groupby("wav_path", dropna=False):
+        labels = []
+        for _, item in grp.iterrows():
+            label = f"{item['target_phoneme']}->{item['primary_confusion']}"
+            if pd.notna(item["primary_confusion_score"]):
+                label += f"({format_score(item['primary_confusion_score'])})"
+            labels.append(label)
+        agg_rows.append({
+            "wav_path": wav_path,
+            "phoneme_top1_confusions": " | ".join(labels),
+        })
+    agg = pd.DataFrame(agg_rows)
+    return agg
+
+
+def attach_recording_misrecognitions(word_df: pd.DataFrame, phoneme_df: pd.DataFrame) -> pd.DataFrame:
+    if word_df.empty:
+        return word_df.copy()
+
+    summary_df = build_recording_misrecognition_summary(phoneme_df)
+    if summary_df.empty:
+        enriched = word_df.copy()
+        enriched["phoneme_top1_confusions"] = ""
+        return enriched
+
+    return word_df.merge(summary_df, on="wav_path", how="left")
+
+
+def make_confusion_stats(phoneme_df: pd.DataFrame) -> pd.DataFrame:
+    if phoneme_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    json_col = "misrecognition_candidates_json"
+    for _, row in phoneme_df.iterrows():
+        target_phoneme = row.get("phoneme")
+        candidates = parse_candidates_json(row.get(json_col))
+        picked = pick_misrecognition_candidates(candidates, target_phoneme, limit=3)
+        for rank, candidate in enumerate(picked, start=1):
+            rows.append({
+                "phoneme": target_phoneme,
+                "candidate_phoneme": candidate.get("phoneme"),
+                "candidate_score": candidate.get("score"),
+                "rank": rank,
+                "accuracy": pd.to_numeric(row.get("accuracy"), errors="coerce"),
+                "target_word": row.get("target_word"),
+                "wav_path": row.get("wav_path"),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    confusion_df = pd.DataFrame(rows)
+    source_totals = (
+        phoneme_df.groupby("phoneme", dropna=False)
+        .agg(source_samples=("phoneme", "count"))
+        .reset_index()
+    )
+    agg = (
+        confusion_df.groupby(["phoneme", "candidate_phoneme"], dropna=False)
+        .agg(
+            pair_samples=("candidate_phoneme", "count"),
+            avg_candidate_score=("candidate_score", "mean"),
+            avg_accuracy=("accuracy", "mean"),
+            rank1_hits=("rank", lambda s: int((s == 1).sum())),
+            unique_recordings=("wav_path", pd.Series.nunique),
+        )
+        .reset_index()
+    )
+    agg = agg.merge(source_totals, on="phoneme", how="left")
+    agg["pair_rate"] = agg["pair_samples"] / agg["source_samples"]
+    agg["rank1_rate"] = agg["rank1_hits"] / agg["source_samples"]
+    agg["pair_rate_pct"] = agg["pair_rate"] * 100.0
+    agg["rank1_rate_pct"] = agg["rank1_rate"] * 100.0
+    agg = agg.sort_values(
+        ["rank1_rate", "pair_rate", "avg_candidate_score"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+    return agg
+
+
+def make_phoneme_confusion_overview(confusion_stats: pd.DataFrame) -> pd.DataFrame:
+    if confusion_stats.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for phoneme, grp in confusion_stats.groupby("phoneme", dropna=False):
+        grp = grp.sort_values(
+            ["rank1_rate", "pair_rate", "avg_candidate_score"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
+        top = grp.iloc[0]
+        rows.append({
+            "phoneme": phoneme,
+            "source_samples": int(top["source_samples"]),
+            "distinct_confusions": int(grp["candidate_phoneme"].nunique()),
+            "most_confused_with": top["candidate_phoneme"],
+            "top_pair_rate_pct": top["pair_rate_pct"],
+            "top1_confusion_rate_pct": top["rank1_rate_pct"],
+            "top_pair_score": top["avg_candidate_score"],
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["top1_confusion_rate_pct", "top_pair_rate_pct", "top_pair_score"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+
+
 @st.cache_data(show_spinner=False)
 def load_formant_track(wav_path: str, time_step_sec: float):
     if not isinstance(wav_path, str) or not os.path.exists(wav_path):
@@ -376,7 +599,7 @@ def build_audio_panel(df: pd.DataFrame, key_prefix: str):
         c for c in [
             "time", "word", "target_word", "phoneme", "accuracy", "pron",
             "fluency", "completeness", "f1_mean", "f2_mean", "f3_mean",
-            "f3_min", "f3_f2_gap_min", "wav_path"
+            "f3_min", "f3_f2_gap_min", "phoneme_top1_confusions", "misrecognition_top3", "wav_path"
         ] if c in sorted_df.columns
     ]
 
@@ -388,7 +611,11 @@ def build_audio_panel(df: pd.DataFrame, key_prefix: str):
         use_container_width=True,
         hide_index=True,
         disabled=[c for c in editor_df.columns if c != "selected"],
-        column_config={"selected": st.column_config.CheckboxColumn("selected")},
+        column_config={
+            "selected": st.column_config.CheckboxColumn("selected"),
+            "phoneme_top1_confusions": st.column_config.TextColumn("音素別誤認候補 Top1", width="large"),
+            "misrecognition_top3": st.column_config.TextColumn("音素別誤認候補 Top3", width="large"),
+        },
         key=f"{key_prefix}_editor",
     )
 
@@ -505,6 +732,7 @@ def render_phoneme_view(phoneme_df: pd.DataFrame):
         plot_phoneme_formants(filtered_df, formant_mode, "phoneme_formants")
 
     build_audio_panel(filtered_df, "phoneme")
+    render_confusion_tables(filtered_df, "phoneme_view")
     render_selected_files_comparison(filtered_df, "phoneme_compare")
 
 
@@ -605,6 +833,83 @@ def render_insight_panel(title: str, items: list[dict[str, str]]):
         return
 
     st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
+
+
+def render_confusion_tables(phoneme_df: pd.DataFrame, key_prefix: str):
+    confusion_stats = make_confusion_stats(phoneme_df)
+    overview_df = make_phoneme_confusion_overview(confusion_stats)
+
+    st.markdown("### 誤認傾向")
+    if confusion_stats.empty:
+        st.info("誤認候補の統計を出せるデータがまだありません。")
+        return
+
+    summary = st.columns(3)
+    best_pair = confusion_stats.iloc[0]
+    weakest_phoneme = overview_df.iloc[0] if not overview_df.empty else None
+    summary[0].metric("最高 Top1 誤認率", f"{best_pair['rank1_rate_pct']:.1f}%")
+    summary[1].metric("最高 ペア出現率", f"{best_pair['pair_rate_pct']:.1f}%")
+    summary[2].metric(
+        "最も崩れやすい音素",
+        str(weakest_phoneme["phoneme"]) if weakest_phoneme is not None else "-",
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 誤認ペア")
+        st.dataframe(
+            confusion_stats.head(20),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "phoneme": "正解音素",
+                "candidate_phoneme": "誤認候補",
+                "source_samples": "正解音素サンプル数",
+                "pair_samples": "該当ペア件数",
+                "pair_rate_pct": "ペア出現率(%)",
+                "avg_candidate_score": "候補スコア平均",
+                "avg_accuracy": "元音素 accuracy 平均",
+                "rank1_hits": "Top1 だった件数",
+                "rank1_rate_pct": "Top1 誤認率(%)",
+                "unique_recordings": "録音数",
+            },
+        )
+    with right:
+        st.markdown("#### 音素ごとの誤認されやすさ")
+        st.dataframe(
+            overview_df.head(20),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "phoneme": "音素",
+                "source_samples": "サンプル数",
+                "distinct_confusions": "候補種類数",
+                "most_confused_with": "最頻候補",
+                "top_pair_rate_pct": "最多ペア出現率(%)",
+                "top1_confusion_rate_pct": "Top1 誤認率(%)",
+                "top_pair_score": "最多ペアの平均スコア",
+            },
+        )
+
+    with st.expander("誤認ペア全件を見る", expanded=False):
+        st.dataframe(
+            confusion_stats,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "phoneme": "正解音素",
+                "candidate_phoneme": "誤認候補",
+                "source_samples": "正解音素サンプル数",
+                "pair_samples": "該当ペア件数",
+                "pair_rate_pct": "ペア出現率(%)",
+                "avg_candidate_score": "候補スコア平均",
+                "avg_accuracy": "元音素 accuracy 平均",
+                "rank1_hits": "Top1 だった件数",
+                "rank1_rate_pct": "Top1 誤認率(%)",
+                "unique_recordings": "録音数",
+            },
+            key=f"{key_prefix}_confusion_pairs",
+        )
 
 
 def _legacy_render_statistics_view(word_df: pd.DataFrame, phoneme_df: pd.DataFrame):
@@ -833,6 +1138,7 @@ def render_statistics_dashboard_v2(word_df: pd.DataFrame, phoneme_df: pd.DataFra
                 use_container_width=True,
                 hide_index=True,
             )
+    render_confusion_tables(phoneme_df, "statistics")
 
 
 def main():
@@ -864,6 +1170,8 @@ def main():
 
     word_df = apply_date_filter(word_df, start_date, end_date)
     phoneme_df = apply_date_filter(phoneme_df, start_date, end_date)
+    phoneme_df = enrich_phoneme_misrecognitions(phoneme_df)
+    word_df = attach_recording_misrecognitions(word_df, phoneme_df)
 
     st.markdown("---")
 

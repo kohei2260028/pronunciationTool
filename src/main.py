@@ -125,6 +125,9 @@ def run():
                 "offset_sec": offset_sec,
                 "duration_sec": duration_sec,
                 "accuracy": row.get("accuracy"),
+                "misrecognition_candidates_json": to_json_str(
+                    row.get("misrecognition_candidates", [])
+                ),
 
                 # 後方互換用: 中央サンプル値
                 "f1": ph_formant.get("f1"),
